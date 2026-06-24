@@ -1,0 +1,13 @@
+bin/
+obj/
+*.user
+*.suo
+*.pdb
+*.nupkg
+*.snupkg
+.vs/
+.nuget/
+publish/
+TestResults/
+Plan.txt
+skill.txt
