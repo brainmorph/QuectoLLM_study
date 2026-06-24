@@ -1,0 +1,185 @@
+== QuectoLLM — Design Plan ==
+
+GOAL
+----
+A from-scratch next-word predictor in C# (.NET 10).
+No third-party libraries. All math is hand-written.
+Feed it one word → it predicts the most likely next word.
+Trained on 20 sentences from a local text file.
+Total parameters: ≤ 256.
+
+
+ARCHITECTURE: Word Embedding Bigram Model
+-----------------------------------------
+The simplest neural architecture that still teaches the core ideas:
+embedding lookup → linear projection → softmax → cross-entropy loss → backprop → SGD.
+
+  Vocabulary size  V  = number of unique words (capped at 50)
+  Embedding dim    d  = 2
+
+  Parameters:
+    E  [V × d]   Embedding matrix      — V*2 values
+    W  [d × V]   Output weight matrix  — 2*V values
+    b  [V]       Output bias vector    — V values
+
+  Total: V*2 + 2*V + V = 5*V
+  With V = 50: exactly 250 parameters ✓ (under 256 ceiling)
+
+
+FORWARD PASS
+------------
+Given input word index `i` (integer, 0..V-1):
+
+  1. Embedding lookup:  e = E[i, :]          shape: [d]
+                        (no multiply — just grab row i from E)
+
+  2. Logits:            z[j] = dot(e, W[:,j]) + b[j]   for j in 0..V-1
+                        equivalently: z = e @ W + b     shape: [V]
+
+  3. Softmax (numerically stable):
+                        z_stable[j] = z[j] - max(z)
+                        exp_z[j]    = exp(z_stable[j])
+                        p[j]        = exp_z[j] / sum(exp_z)     shape: [V]
+
+  4. Predicted next word: argmax(p)
+
+
+LOSS
+----
+  Cross-entropy:  L = -log(p[target_index])
+
+  This is the only loss used. No regularization.
+
+
+BACKWARD PASS (manual gradients)
+---------------------------------
+  Softmax + cross-entropy gradient (combined, very clean):
+      dL/dz[j] = p[j] - 1(j == target_index)
+
+  let dz = above vector, shape [V]
+
+  Gradient w.r.t. bias:
+      dL/db = dz                                    shape: [V]
+
+  Gradient w.r.t. output weights:
+      dL/dW[k, j] = e[k] * dz[j]                   shape: [d × V]
+      (outer product of e and dz)
+
+  Gradient w.r.t. embedding row i:
+      dL/de[k] = sum_j( W[k, j] * dz[j] )          shape: [d]
+      (matrix-vector: W @ dz)
+
+  Only E[i, :] is updated — the row for the current input word.
+
+
+SGD UPDATE (one sample at a time — online gradient descent)
+------------------------------------------------------------
+  learning_rate = 0.01   (tune as needed, start here)
+
+  E[i, k] -= learning_rate * dL/de[k]    for k in 0..d-1
+  W[k, j] -= learning_rate * dL/dW[k,j]  for k in 0..d-1, j in 0..V-1
+  b[j]    -= learning_rate * dz[j]        for j in 0..V-1
+
+
+TRAINING LOOP
+-------------
+  Epochs: 1000 (print average loss every 100)
+
+  Each epoch:
+    1. Shuffle training pairs (Fisher-Yates)
+    2. For each pair (input_word, target_word):
+       a. Forward pass → p, z, e
+       b. Loss = -log(p[target_index])
+       c. Backward pass → dz, dW, db, de
+       d. SGD update
+    3. Accumulate total loss, print avg at milestone epochs
+
+
+TOKENIZER / DATA PREP
+----------------------
+  1. Read all lines from corpus.txt
+  2. Per line (sentence):
+       - Lowercase everything
+       - Strip punctuation (keep only a-z and spaces)
+       - Split on whitespace
+       - Emit (words[i], words[i+1]) pairs for i in 0..len-2
+         (pairs do NOT cross sentence boundaries)
+  3. Count word frequencies across all sentences
+  4. Vocabulary = top 50 most frequent words
+     Words not in vocab are dropped from training pairs entirely
+     (no <UNK> token needed at this scale)
+  5. word_to_index: Dictionary<string, int>
+  6. index_to_word: string[]
+
+
+WEIGHT INITIALIZATION
+---------------------
+  Xavier uniform: random values in [-1/sqrt(d), +1/sqrt(d)]
+  For d=2: range is [-0.707, +0.707]
+  Use System.Random with a fixed seed (e.g. 42) for reproducibility.
+
+
+INFERENCE
+---------
+  After training:
+    1. Prompt user: "Enter a word:"
+    2. Read word, lowercase it
+    3. If word not in vocabulary, print "unknown word" and re-prompt
+    4. Forward pass → p
+    5. Print top-3 predictions with their probabilities
+    6. Loop until user quits (empty input)
+
+
+FILE STRUCTURE
+--------------
+  QuectoLLM_study/
+    Program.cs        Entry point. Wires together Tokenizer, Model, training loop, inference prompt.
+    Tokenizer.cs      Loads corpus.txt, builds vocab, returns training pairs as (int, int)[].
+    Model.cs          Holds E, W, b arrays. Methods: Forward(), Backward(), Update().
+    data/
+      corpus.txt      20 sentences of training text (plain UTF-8, one sentence per line).
+
+
+MATH HELPERS (all in-file, no imports beyond System)
+-----------------------------------------------------
+  Softmax          — implemented in Model.cs (stable version, subtract max first)
+  Dot product      — simple loop over array
+  Outer product    — double loop, returns [d × V] as double[,]
+  Matrix-vector    — W @ dz, returns double[d]
+  Random init      — System.Random, uniform range
+
+
+PARAMETER COUNT VERIFICATION
+-----------------------------
+  V = 50 (vocabulary cap)
+  d = 2  (embedding dim)
+
+  E:  50 × 2 = 100
+  W:   2 × 50 = 100
+  b:        50 =  50
+  ─────────────────
+  Total:      250  ✓
+
+
+WHAT THIS TEACHES
+-----------------
+  - Vocabulary and tokenization (words → integers)
+  - Word embeddings (each word is a learned 2D point)
+  - Linear projection from embedding space to vocabulary space
+  - Softmax turning logits into a probability distribution
+  - Cross-entropy loss as "how surprised were we by the right answer"
+  - The combined softmax+cross-entropy gradient (p - one_hot_target)
+  - Backpropagation: chain rule applied manually, layer by layer
+  - SGD: nudge each weight in the direction that reduces loss
+  - Why loss decreasing means the model is learning
+
+
+OUT OF SCOPE
+------------
+  - Attention / transformers
+  - Multiple layers
+  - Batching
+  - Autograd / any ML framework
+  - Tokenizers beyond whitespace split
+  - Context window > 1 word
+  - Any third-party NuGet package
